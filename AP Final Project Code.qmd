@@ -1,0 +1,422 @@
+---
+title: "AP Final Project Code"
+format: html
+editor: visual
+---
+
+### Import Libraries
+
+```{r}
+library(fpp3)
+library(readr)
+library(dplyr)
+library(lubridate)
+library(tidyverse)
+library(tsibble)
+library(feasts)
+library(fabletools)
+library(janitor)
+library(slider)
+library(skimr)
+
+```
+
+### Load Data
+
+```{r}
+
+energy_raw <- read_csv("Demand_data.csv", show_col_types = FALSE) |>
+  clean_names()
+
+# Initial resampling and conversion
+energy_hourly <- energy_raw |>
+  distinct(hora, .keep_all = TRUE) |>
+  arrange(hora) |>
+  mutate(hour = floor_date(hora, "hour")) |>
+  group_by(hour) |>
+  summarise(
+    real       = mean(real, na.rm = TRUE),
+    prevista   = mean(prevista, na.rm = TRUE),
+    programada = mean(programada, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  as_tsibble(index = hour) |>
+  fill_gaps()  
+
+glimpse(energy_hourly)
+
+```
+
+### Exploratory Data Analysis
+
+```{r}
+
+energy_hourly |>
+  pivot_longer(cols = c(real, prevista, programada),
+               names_to = "series",
+               values_to = "value") |>
+  ggplot(aes(x = series, y = value)) +
+  geom_boxplot(outlier.color = "red") +
+  labs(
+    title = "Outlier Analysis",
+    x = "",
+    y = "Demand"
+  )
+
+```
+
+```{r}
+# Hourly plot
+autoplot(energy_hourly, real) +
+  labs(
+    title = "Hourly Real Electricity Demand",
+    x = "Time",
+    y = "MW"
+  )
+
+# Daily average
+energy_daily <- energy_hourly |>
+  index_by(day = as_date(hour)) |>
+  summarise(real = mean(real, na.rm = TRUE))
+
+autoplot(energy_daily, real) +
+  labs(
+    title = "Daily Average Electricity Demand",
+    x = "Date",
+    y = "MW"
+  )
+
+```
+
+```{r}
+
+energy_features <- energy_hourly |>
+  mutate(
+    hour_of_day = hour(hour),
+    wday        = wday(hour, label = TRUE),
+    month       = month(hour, label = TRUE)
+  )
+
+# Hourly pattern
+energy_features |>
+  group_by(hour_of_day) |>
+  summarise(mean_real = mean(real, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(hour_of_day, mean_real)) +
+  geom_line() +
+  labs(
+    title = "Average Hourly Pattern",
+    x = "Hour",
+    y = "Mean Demand"
+  )
+
+# Daily pattern
+energy_features |>
+  group_by(wday) |>
+  summarise(mean_real = mean(real, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(wday, mean_real, group = 1)) +
+  geom_line() +
+  labs(
+    title = "Average Daily Pattern",
+    x = "Day",
+    y = "Mean Demand"
+  )
+
+# Monthly pattern
+energy_features |>
+  group_by(month) |>
+  summarise(mean_real = mean(real, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(month, mean_real, group = 1)) +
+  geom_line() +
+  labs(
+    title = "Average Monthly Pattern",
+    x = "Month",
+    y = "Mean Demand"
+  )
+
+```
+
+```{r}
+
+energy_hourly |>
+  ACF(real) |>
+  autoplot() +
+  labs(
+    title = "Hourly Demand ACF",
+    x = "Lag (hours)",
+    y = "ACF"
+  )
+
+```
+
+```{r}
+
+energy_daily |>
+  mutate(roll_sd = slide_dbl(real, sd, .before = 30, .complete = FALSE)) |>
+  ggplot(aes(day, roll_sd)) +
+  geom_line() +
+  labs(
+    title = "Rolling 30-Day STD Demand",
+    x = "Date",
+    y = "Standard Deviation"
+  )
+
+```
+
+```{r}
+
+energy_hourly |>
+  as_tibble() |>
+  select(real, prevista, programada) |>
+  cor(use = "pairwise.complete.obs")
+
+
+
+```
+
+```{r}
+
+energy_daily_ts <- energy_daily |>
+  as_tsibble(index = day)
+
+energy_daily_ts |>
+  model(STL(real ~ season(window = "periodic"))) |>
+  components() |>
+  autoplot()
+
+
+```
+
+```{r}
+# Real vs. Prevista and Programada
+energy_hourly |>
+  filter(year(hour) == 2014) |> 
+  pivot_longer(
+    cols = c(real, prevista, programada),
+    names_to = "series",
+    values_to = "value"
+  ) |>
+  ggplot(aes(x = hour, y = value, colour = series)) +
+  geom_line(linewidth = 0.5) +
+  labs(
+    title = "Real Demand vs. Benchmarks (2014)",
+    y = "Demand (MW)",
+    colour = "Series"
+  ) +
+  scale_color_manual(values = c("real" = "black", "prevista" = "blue", "programada" = "red")) +
+  guides(colour = guide_legend(override.aes = list(linewidth = 1.5)))
+
+```
+
+```{r}
+
+# Benchmark Forecasting Error 
+energy_hourly |>
+  mutate(error = real - prevista) |>
+  ggplot(aes(x = error)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 100, fill = "lightblue", colour = "black") +
+  geom_density(colour = "red", linewidth = 1) +
+  xlim(-5, 5) + 
+  geom_vline(xintercept = mean(energy_hourly$error, na.rm = TRUE), 
+             linetype = "dashed", colour = "darkgreen", linewidth = 1) +
+  labs(
+    title = "Distribution of Prevista Forecast Errors",
+    subtitle = "Error = Real - Prevista",
+    x = "Error (MW)",
+    y = "Density"
+  )
+
+```
+
+```{r}
+
+# Calculate RMSE
+calculate_rmse <- function(actual, predicted) {
+  na_removed <- na.omit(data.frame(actual, predicted))
+  rmse <- sqrt(mean((na_removed$actual - na_removed$predicted)^2))
+  return(rmse)
+}
+
+#Prevista RMSE
+rmse_prevista_value <- energy_hourly |>
+  as_tibble() |> 
+  summarise(rmse = calculate_rmse(real, prevista)) |>
+  pull(rmse)
+
+#Programada RMSE
+rmse_programada_value <- energy_hourly |>
+  as_tibble() |> 
+  summarise(rmse = calculate_rmse(real, programada)) |>
+  pull(rmse)
+
+print("--- Final Benchmark RMSE Results ---")
+print(paste0("Prevista vs Real RMSE: ", round(rmse_prevista_value, 4)))
+print(paste0("Programada vs Real RMSE: ", round(rmse_programada_value, 4)))
+
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+### Discussion Code
+
+```{r}
+
+energy_raw <- read_csv("Demand_data.csv", show_col_types = FALSE)
+
+energy_hourly <- energy_raw |>
+  distinct(Hora, .keep_all = TRUE) |>
+  mutate(Hora = as_datetime(Hora)) |>
+  arrange(Hora) |>
+  as_tsibble(index = Hora) |>
+  index_by(Hour = floor_date(Hora, "1 hour")) |>
+  summarise(Real = mean(Real, na.rm = TRUE)) |>
+  as_tsibble(index = Hour) |>
+  fill_gaps()                      
+
+max_hour    <- max(energy_hourly$Hour)
+train_end   <- floor_date(max_hour %m-% months(1), unit = "hour")
+train_start <- train_end %m-% months(3) + hours(1)
+test_end    <- train_end %m+% months(1)
+
+train_ts <- energy_hourly |> filter(Hour >= train_start, Hour <= train_end)
+test_ts  <- energy_hourly |> filter(Hour >  train_end, Hour <= test_end)
+
+#TSLM models
+train_manual <- train_ts |>
+  mutate(dow = factor(wday(Hour, week_start = 1, label = TRUE)))
+test_manual  <- test_ts  |>
+  mutate(dow = factor(wday(Hour, week_start = 1, label = TRUE),
+                      levels = levels(train_manual$dow)))
+
+fit_manual <- train_manual |>
+  model(manual = TSLM(Real ~ trend() + dow))
+
+report(fit_manual)
+
+fc_manual <- forecast(fit_manual, new_data = test_manual)
+
+cands <- train_ts |>
+  model(
+    tslm_trend     = TSLM(Real ~ trend()),
+    tslm_trend_day = TSLM(Real ~ trend() + season("day"))
+  )
+
+best_name <- cands |>
+  glance() |>
+  arrange(AICc) |>
+  slice(1) |>
+  pull(.model)
+
+fit_auto <- cands |> select(!!best_name)
+report(fit_auto)
+
+fc_auto <- forecast(fit_auto, h = "1 month")
+
+plot_limits <- c(train_start, test_end)
+
+# Manual plot
+p_manual <- autoplot(train_ts, Real) +
+  autolayer(fc_manual, level = NULL) +                 
+  scale_x_datetime(limits = plot_limits) +
+  labs(title = "Manual TSLM Forecast",
+       x = "Time", y = "MWh") +
+  theme_minimal()
+print(p_manual)
+
+# Auto plot
+p_auto <- autoplot(train_ts, Real) +
+  autolayer(fc_auto, level = NULL) +
+  scale_x_datetime(limits = plot_limits) +
+  labs(title = paste0("Auto TSLM Forecast"),
+       x = "Time", y = "MWh") +
+  theme_minimal()
+print(p_auto)
+
+acc_manual <- accuracy(fc_manual, test_ts)
+acc_auto   <- accuracy(fc_auto,   test_ts)
+
+acc_manual
+acc_auto
+
+# Ljung–Box on training residuals
+lb_manual <- fit_manual |>
+  augment() |>
+  drop_na(.resid) |>
+  features(.resid, ljung_box, lag = 24, dof = 0)
+
+lb_auto <- fit_auto |>
+  augment() |>
+  drop_na(.resid) |>
+  features(.resid, ljung_box, lag = 24, dof = 0)
+
+lb_manual
+lb_auto
+
+
+```
+
+```{r}
+
+# Add log column
+energy_log <- energy_hourly |>
+  mutate(log_real = log(Real))
+
+train_log <- energy_log |> 
+  filter(Hour >= train_start, Hour <= train_end)
+
+test_log <- energy_log |>
+  filter(Hour > train_end, Hour <= test_end)
+
+fit_log <- train_log |>
+  model(tslm_log = TSLM(log_real ~ trend() + season("day")))
+
+report(fit_log)
+
+fc_log <- forecast(fit_log, new_data = test_log)
+
+fc_log2 <- fc_log |>
+  rename(.fitted_log = .mean)
+
+acc_log <- accuracy(
+  fc_log2,
+  test_log,
+  by = ".model",
+  measures = list(
+    ME = ME,
+    RMSE = RMSE,
+    MAE = MAE,
+    MAPE = MAPE
+  ),
+  response = "log_real",
+  estimate = ".fitted_log"
+)
+
+acc_log
+
+fc_log_back <- fc_log2 |>
+  mutate(Real = exp(.fitted_log))
+
+#Plot
+p_log <- autoplot(train_ts, Real) +
+  autolayer(fc_log_back, Real, color = "blue") +
+  labs(title = "Log Transformation TSLM",
+       x = "Time", y = "MWh") +
+  theme_minimal()
+
+p_log
+
+
+```
+
+```         
+```
