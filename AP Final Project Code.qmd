@@ -346,13 +346,11 @@ cv_data_bc <- cv_base_bc |>
   )
 
 
-#Fit model set on each fold and generate 1 step ahead forecasts
+#Fit model set on each fold and generate 6 hour ahead forecasts
 cv_fc <- cv_data_bc |>
   model(
-    TSLM = TSLM(
-      real_bc ~ trend() + season("day")
-    ),
-    ETS   = ETS(real_bc),
+    TSLM = TSLM(real_bc ~ trend() + season("day")),
+    ETS  = ETS(real_bc),
     ARIMA = ARIMA(real_bc)
   ) |>
   forecast(h = 1)
@@ -361,14 +359,15 @@ cv_errors <- cv_fc |>
   as_tibble() |>
   select(hour, .model, .mean) |>
   mutate(
-    .mean = inv_box_cox(.mean, lambda_train)   # back to original MW scale
+    .mean = inv_box_cox(.mean, lambda_train)   # back to MW
   ) |>
   left_join(
     cv_base |>
       select(hour, real) |>
       as_tibble(),
     by = "hour"
-  )
+  ) |>
+  filter(!is.na(real)) 
 
 cv_accuracy_models <- cv_errors |>
   group_by(.model) |>
@@ -411,58 +410,13 @@ cv_accuracy_all
 
 ```{r}
 
-best_model <- cv_accuracy_models |>
-  arrange(RMSE) |>
-  slice(1) |>
-  pull(.model)
-
-cv_best_joined <- cv_base |>
-  as_tibble() |>
-  select(hour, real, prevista, programada) |>
-  left_join(
-    cv_errors |>
-      filter(.model == best_model) |>
-      select(hour, .mean),
-    by = "hour"
+model_errors <- cv_errors |>
+  mutate(
+    error     = .mean - real,
+    abs_error = abs(error)
   ) |>
-  rename(best_model_fc = .mean)
-
-week_sample <- cv_best_joined |>
-  filter(hour >= ymd_h("2015-03-01 00"),
-         hour <= ymd_h("2015-03-07 23")) |>
-  pivot_longer(
-    cols = c(real, prevista, programada, best_model_fc),
-    names_to = "series",
-    values_to = "value"
-  )
-
-week_sample |>
-  ggplot(aes(x = hour, y = value, colour = series)) +
-  geom_line(linewidth = 0.5, alpha = 0.9) +
-  labs(
-    title = paste(
-      "Real vs Benchmarks vs",
-      best_model,
-      "2015 Sample Week Forecasts"
-    ),
-    x = "Time",
-    y = "Demand (MW)",
-    colour = "Series"
-  )
-
-
-
-```
-
-```{r}
-
-best_model_errors <- cv_errors |>
-  filter(.model == best_model) |>
-  transmute(
-    hour,
-    .model,
-    error = .mean - real
-  )
+  select(hour, .model, error, abs_error) |>
+  mutate(source = "stat_model")
 
 benchmark_errors <- cv_base |>
   as_tibble() |>
@@ -471,41 +425,50 @@ benchmark_errors <- cv_base |>
     names_to = ".model",
     values_to = "forecast"
   ) |>
-  transmute(
-    hour,
-    .model,
-    error = forecast - real
-  )
+  mutate(
+    error     = forecast - real,
+    abs_error = abs(error),
+    source    = "benchmark"
+  ) |>
+  select(hour, .model, error, abs_error, source)
 
+# Combine all errors
 all_errors <- bind_rows(
-  best_model_errors,
+  model_errors,
   benchmark_errors
 )
 
-# histogram of errors
 all_errors |>
-  ggplot(aes(x = error, fill = .model)) +
-  geom_histogram(aes(y = after_stat(density)),
-                 bins = 100,
-                 alpha = 0.4,
-                 position = "identity") +
-  geom_density(alpha = 0.7) +
-  geom_vline(
-    data = all_errors |>
-      group_by(.model) |>
-      summarise(mean_error = mean(error, na.rm = TRUE)),
-    aes(xintercept = mean_error, colour = .model),
-    linetype = "dashed"
-  ) +
-  coord_cartesian(xlim = c(-2, 2)) + 
+  ggplot(aes(
+    x    = reorder(.model, abs_error, FUN = median),
+    y    = abs_error,
+    fill = source
+  )) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  coord_cartesian(ylim = c(0, 2)) +  
   labs(
-    title = "Forecast Error Distribution",
-    subtitle = paste("Best model:", best_model,
-                     "vs Prevista & Programada"),
-    x = "Forecast Error (Forecast - Actual MW)",
-    y = "Density",
-    fill = "Series",
-    colour = "Series"
+    title    = "Absolute Forecast Errors (2015 CV)",
+    x        = "Model",
+    y        = "Absolute Error (MW)",
+    fill     = "Source"
   )
 
+```
+
+```{r}
+
+cv_accuracy_all |>
+  ggplot(aes(
+    x    = reorder(.model, RMSE),
+    y    = RMSE,
+    fill = source
+  )) +
+  geom_col() +
+  labs(
+    title    = "1-Step-Ahead Forecast RMSE by Model (2015 CV)",
+    x        = "Model",
+    y        = "RMSE (MW)",
+    fill     = "Source"
+  ) +
+  coord_flip()  
 ```
