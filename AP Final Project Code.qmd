@@ -255,168 +255,257 @@ print(paste0("Programada vs Real RMSE: ", round(rmse_programada_value, 4)))
 
 ```
 
-```{r}
-
-```
+### Pre-processing & Feature Engineering
 
 ```{r}
 
-```
-
-```{r}
-
-```
-
-### Discussion Code
-
-```{r}
-
-energy_raw <- read_csv("Demand_data.csv", show_col_types = FALSE)
-
-energy_hourly <- energy_raw |>
-  distinct(Hora, .keep_all = TRUE) |>
-  mutate(Hora = as_datetime(Hora)) |>
-  arrange(Hora) |>
-  as_tsibble(index = Hora) |>
-  index_by(Hour = floor_date(Hora, "1 hour")) |>
-  summarise(Real = mean(Real, na.rm = TRUE)) |>
-  as_tsibble(index = Hour) |>
-  fill_gaps()                      
-
-max_hour    <- max(energy_hourly$Hour)
-train_end   <- floor_date(max_hour %m-% months(1), unit = "hour")
-train_start <- train_end %m-% months(3) + hours(1)
-test_end    <- train_end %m+% months(1)
-
-train_ts <- energy_hourly |> filter(Hour >= train_start, Hour <= train_end)
-test_ts  <- energy_hourly |> filter(Hour >  train_end, Hour <= test_end)
-
-#TSLM models
-train_manual <- train_ts |>
-  mutate(dow = factor(wday(Hour, week_start = 1, label = TRUE)))
-test_manual  <- test_ts  |>
-  mutate(dow = factor(wday(Hour, week_start = 1, label = TRUE),
-                      levels = levels(train_manual$dow)))
-
-fit_manual <- train_manual |>
-  model(manual = TSLM(Real ~ trend() + dow))
-
-report(fit_manual)
-
-fc_manual <- forecast(fit_manual, new_data = test_manual)
-
-cands <- train_ts |>
-  model(
-    tslm_trend     = TSLM(Real ~ trend()),
-    tslm_trend_day = TSLM(Real ~ trend() + season("day"))
+energy_hourly_clean <- energy_hourly |>
+  mutate(
+    real = if_else(!is.finite(real) | real <= 0, NA_real_, real)
   )
 
-best_name <- cands |>
-  glance() |>
-  arrange(AICc) |>
+# Impute missing values
+energy_hourly_clean <- energy_hourly_clean |>
+  tidyr::fill(real, .direction = "downup")
+
+
+```
+
+### Training / Validation Split
+
+```{r}
+
+# Training: 2014-2015
+train_data <- energy_hourly_clean |>
+  filter(hour >= ymd_h("2014-01-01 00"),
+         hour <= ymd_h("2015-12-31 23"))
+
+nrow(train_data)
+
+# Box–Cox lambda on training data
+lambda_train <- train_data |>
+  features(real, features = guerrero, .period = 24) |>
+  pull(lambda_guerrero)
+
+lambda_train
+
+
+```
+
+### Model Training
+
+```{r}
+# Fit Models (TSLM / ETS / ARIMA )
+fit_models <- train_data |>
+  model(
+    TSLM = TSLM(
+      box_cox(real, lambda_train) ~
+        trend() +
+        season("1 day")
+    ),
+    ETS   = ETS(box_cox(real, lambda_train)),
+    ARIMA = ARIMA(box_cox(real, lambda_train))
+  )
+
+
+report(fit_models)
+
+
+```
+
+### Model Evaluation - Rolling Origin Time-series CV
+
+```{r}
+
+# Inverse Box-cox helper
+inv_box_cox <- function(x, lambda) {
+  if (lambda == 0) {
+    exp(x)
+  } else {
+    (lambda * x + 1)^(1 / lambda)
+  }
+}
+
+# Rolling Origin Time-series CV
+cv_base <- train_data |>
+  filter(year(hour) == 2015)
+
+cv_data <- cv_base |>
+  stretch_tsibble(
+    .init = 24 * 30,
+    .step = 24 * 60
+  )
+
+cv_base_bc <- cv_base |>
+  mutate(real_bc = box_cox(real, lambda_train))
+
+cv_data_bc <- cv_base_bc |>
+  stretch_tsibble(
+    .init = 24 * 30,
+    .step = 24 * 60
+  )
+
+
+#Fit model set on each fold and generate 1 step ahead forecasts
+cv_fc <- cv_data_bc |>
+  model(
+    TSLM = TSLM(
+      real_bc ~ trend() + season("day")
+    ),
+    ETS   = ETS(real_bc),
+    ARIMA = ARIMA(real_bc)
+  ) |>
+  forecast(h = 1)
+
+cv_errors <- cv_fc |>
+  as_tibble() |>
+  select(hour, .model, .mean) |>
+  mutate(
+    .mean = inv_box_cox(.mean, lambda_train)   # back to original MW scale
+  ) |>
+  left_join(
+    cv_base |>
+      select(hour, real) |>
+      as_tibble(),
+    by = "hour"
+  )
+
+cv_accuracy_models <- cv_errors |>
+  group_by(.model) |>
+  summarise(
+    RMSE = sqrt(mean((.mean - real)^2, na.rm = TRUE)),
+    MAE  = mean(abs(.mean - real), na.rm = TRUE),
+    MAPE = mean(abs((.mean - real) / real), na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+benchmark_accuracy_cv <- cv_base |>
+  as_tibble() |>
+  pivot_longer(
+    cols = c(prevista, programada),
+    names_to = ".model",
+    values_to = "forecast"
+  ) |>
+  group_by(.model) |>
+  summarise(
+    RMSE = sqrt(mean((real - forecast)^2, na.rm = TRUE)),
+    MAE  = mean(abs(real - forecast), na.rm = TRUE),
+    MAPE = mean(abs((real - forecast) / real), na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+cv_accuracy_all <- bind_rows(
+  cv_accuracy_models |>
+    mutate(source = "stat_model"),
+  benchmark_accuracy_cv |>
+    mutate(source = "benchmark")
+) |>
+  arrange(RMSE)
+
+cv_accuracy_all
+
+
+```
+
+### Visualize Results
+
+```{r}
+
+best_model <- cv_accuracy_models |>
+  arrange(RMSE) |>
   slice(1) |>
   pull(.model)
 
-fit_auto <- cands |> select(!!best_name)
-report(fit_auto)
+cv_best_joined <- cv_base |>
+  as_tibble() |>
+  select(hour, real, prevista, programada) |>
+  left_join(
+    cv_errors |>
+      filter(.model == best_model) |>
+      select(hour, .mean),
+    by = "hour"
+  ) |>
+  rename(best_model_fc = .mean)
 
-fc_auto <- forecast(fit_auto, h = "1 month")
+week_sample <- cv_best_joined |>
+  filter(hour >= ymd_h("2015-03-01 00"),
+         hour <= ymd_h("2015-03-07 23")) |>
+  pivot_longer(
+    cols = c(real, prevista, programada, best_model_fc),
+    names_to = "series",
+    values_to = "value"
+  )
 
-plot_limits <- c(train_start, test_end)
+week_sample |>
+  ggplot(aes(x = hour, y = value, colour = series)) +
+  geom_line(linewidth = 0.5, alpha = 0.9) +
+  labs(
+    title = paste(
+      "Real vs Benchmarks vs",
+      best_model,
+      "2015 Sample Week Forecasts"
+    ),
+    x = "Time",
+    y = "Demand (MW)",
+    colour = "Series"
+  )
 
-# Manual plot
-p_manual <- autoplot(train_ts, Real) +
-  autolayer(fc_manual, level = NULL) +                 
-  scale_x_datetime(limits = plot_limits) +
-  labs(title = "Manual TSLM Forecast",
-       x = "Time", y = "MWh") +
-  theme_minimal()
-print(p_manual)
-
-# Auto plot
-p_auto <- autoplot(train_ts, Real) +
-  autolayer(fc_auto, level = NULL) +
-  scale_x_datetime(limits = plot_limits) +
-  labs(title = paste0("Auto TSLM Forecast"),
-       x = "Time", y = "MWh") +
-  theme_minimal()
-print(p_auto)
-
-acc_manual <- accuracy(fc_manual, test_ts)
-acc_auto   <- accuracy(fc_auto,   test_ts)
-
-acc_manual
-acc_auto
-
-# Ljung–Box on training residuals
-lb_manual <- fit_manual |>
-  augment() |>
-  drop_na(.resid) |>
-  features(.resid, ljung_box, lag = 24, dof = 0)
-
-lb_auto <- fit_auto |>
-  augment() |>
-  drop_na(.resid) |>
-  features(.resid, ljung_box, lag = 24, dof = 0)
-
-lb_manual
-lb_auto
 
 
 ```
 
 ```{r}
 
-# Add log column
-energy_log <- energy_hourly |>
-  mutate(log_real = log(Real))
+best_model_errors <- cv_errors |>
+  filter(.model == best_model) |>
+  transmute(
+    hour,
+    .model,
+    error = .mean - real
+  )
 
-train_log <- energy_log |> 
-  filter(Hour >= train_start, Hour <= train_end)
+benchmark_errors <- cv_base |>
+  as_tibble() |>
+  pivot_longer(
+    cols = c(prevista, programada),
+    names_to = ".model",
+    values_to = "forecast"
+  ) |>
+  transmute(
+    hour,
+    .model,
+    error = forecast - real
+  )
 
-test_log <- energy_log |>
-  filter(Hour > train_end, Hour <= test_end)
-
-fit_log <- train_log |>
-  model(tslm_log = TSLM(log_real ~ trend() + season("day")))
-
-report(fit_log)
-
-fc_log <- forecast(fit_log, new_data = test_log)
-
-fc_log2 <- fc_log |>
-  rename(.fitted_log = .mean)
-
-acc_log <- accuracy(
-  fc_log2,
-  test_log,
-  by = ".model",
-  measures = list(
-    ME = ME,
-    RMSE = RMSE,
-    MAE = MAE,
-    MAPE = MAPE
-  ),
-  response = "log_real",
-  estimate = ".fitted_log"
+all_errors <- bind_rows(
+  best_model_errors,
+  benchmark_errors
 )
 
-acc_log
+# histogram of errors
+all_errors |>
+  ggplot(aes(x = error, fill = .model)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 100,
+                 alpha = 0.4,
+                 position = "identity") +
+  geom_density(alpha = 0.7) +
+  geom_vline(
+    data = all_errors |>
+      group_by(.model) |>
+      summarise(mean_error = mean(error, na.rm = TRUE)),
+    aes(xintercept = mean_error, colour = .model),
+    linetype = "dashed"
+  ) +
+  coord_cartesian(xlim = c(-2, 2)) + 
+  labs(
+    title = "Forecast Error Distribution",
+    subtitle = paste("Best model:", best_model,
+                     "vs Prevista & Programada"),
+    x = "Forecast Error (Forecast - Actual MW)",
+    y = "Density",
+    fill = "Series",
+    colour = "Series"
+  )
 
-fc_log_back <- fc_log2 |>
-  mutate(Real = exp(.fitted_log))
-
-#Plot
-p_log <- autoplot(train_ts, Real) +
-  autolayer(fc_log_back, Real, color = "blue") +
-  labs(title = "Log Transformation TSLM",
-       x = "Time", y = "MWh") +
-  theme_minimal()
-
-p_log
-
-
-```
-
-```         
 ```
